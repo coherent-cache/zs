@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake fzf for the test suite: `--version` reports $FZF_FAKE_VERSION
+# (default 0.44.1 — Debian's, older than FZF_MIN). Any real invocation
+# exits 2, like an old fzf choking on an unknown flag.
+if [ "${1:-}" = "--version" ]; then
+    printf '%s (fake)\n' "${FZF_FAKE_VERSION:-0.44.1}"
+    exit 0
+fi
+exit 2

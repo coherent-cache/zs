@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# zp — create + attach the NEXT session for this kitty tab's project.
+# Used by the kitty split-pane maps: the pane inherits the name base from a
+# SIBLING pane's session in the same tab (myproj.1 → myproj.2), so inner
+# `cd`s never affect naming — the tab's project is sticky. The pane's
+# directory comes from kitty's --cwd=current (tracked via the OSC 7 hook in
+# ~/.bash/.zmx). Outside kitty, or in a tab with no attached sibling, falls
+# back to naming by cwd. Plain login shell when zmx is missing.
+set -u
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+command -v zmx >/dev/null 2>&1 || exec "${SHELL:-/bin/bash}" -l
+
+# Name base of the first sibling pane in my kitty tab that runs `zmx attach X`
+# (strips the trailing .N). Socket remote control only — see zs; regular
+# windows get KITTY_PID but not KITTY_LISTEN_ON, so derive the socket.
+sibling_base() {
+    [ -n "${KITTY_WINDOW_ID:-}" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    local to="${KITTY_LISTEN_ON:-}"
+    if [ -z "$to" ] && [ -n "${KITTY_PID:-}" ]; then
+        if [ -S "/tmp/mykitty-$KITTY_PID" ]; then
+            to="unix:/tmp/mykitty-$KITTY_PID"
+        elif [ "$(uname -s)" = Linux ]; then
+            to="unix:@kitty-$KITTY_PID"
+        fi
+    fi
+    [ -n "$to" ] || return 1
+    local k
+    for k in kitten kitty /Applications/kitty.app/Contents/MacOS/kitten; do
+        command -v "$k" >/dev/null 2>&1 && break
+    done
+    "$k" @ --to "$to" ls 2>/dev/null | python3 -c '
+import json, sys, os, re
+wid = int(sys.argv[1])
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+def session_of(w):
+    """The zmx session a window represents, or None.
+
+    Two shapes matter. A pane may show `zmx attach NAME` as its foreground
+    process, but a REMOTE wrapper often shows the `ssh` child instead once the
+    connection is up — and missing that second shape is why splitting from an
+    @host pane used to fall through to local cwd naming (spec 004 US5)."""
+    for p in w.get("foreground_processes", []):
+        cl = p.get("cmdline") or []
+        if not cl:
+            continue
+        exe = os.path.basename(cl[0])
+        if len(cl) >= 3 and exe == "zmx" and cl[1] in ("attach", "a"):
+            return cl[2]
+        if exe == "ssh":
+            args = [a for a in cl[1:] if not a.startswith("-")]
+            if args:
+                return "@" + args[0]
+    return None
+
+for osw in data:
+    for tab in osw.get("tabs", []):
+        ids = [w["id"] for w in tab.get("windows", [])]
+        if wid not in ids:
+            continue
+        wins = {w["id"]: w for w in tab.get("windows", [])}
+        # Prefer the pane the operator actually split FROM. kitty records per-tab
+        # activation order in active_window_history (most recent last), so walk
+        # it backwards; fall back to tab order when it is absent (older kitty).
+        order = [i for i in reversed(tab.get("active_window_history") or []) if i in wins]
+        order += [i for i in ids if i not in order]
+        for i in order:
+            if i == wid:
+                continue
+            name = session_of(wins[i])
+            if name:
+                print(re.sub(r"\.\d+$", "", name))
+                sys.exit(0)
+        sys.exit(1)
+sys.exit(1)' "$KITTY_WINDOW_ID" | grep .
+}
+
+# spec 003 US2 (FR-009): choose the pane's locality explicitly. Bare zp stays
+# "another pane, same place"; these flags are the non-interactive form of the
+# picker-split ("another pane, you choose where").
+#   --host HOST  next @HOST.N wrapper pane on that host (same as splitting
+#                from a numbered @HOST tab), skipping sibling detection
+#   --local      force cwd naming, bypassing the @wrapper branch entirely
+force_local=""
+case "${1:-}" in
+--host)
+    if [ -z "${2:-}" ]; then
+        echo "zp: --host needs a host" >&2
+        exec "${SHELL:-/bin/bash}" -l   # a split pane must never die into oblivion
+    fi
+    exec env ZS_CREATOR=zp zs --attach "$(zn -n "@$2")" ssh "$2"
+    ;;
+--local) force_local=1 ;;
+esac
+
+if [ -n "$force_local" ] || ! base=$(sibling_base); then
+    # No identifiable source pane (no kitty remote control, or nothing in this
+    # tab is a session) -> local cwd naming. Say so when we were in a position
+    # to have done better, so a split that lands locally is never a silent
+    # surprise (spec 004 US5 / FR-001). Never guess a host.
+    [ -z "$force_local" ] && [ -n "${KITTY_WINDOW_ID:-}" ] \
+        && echo "zp: no remote pane detected as the split source — creating a LOCAL pane" >&2
+    base="${PWD##*/}"
+    [ "$PWD" = "$HOME" ] && base=home
+    base="${base//[^A-Za-z0-9._-]/-}"
+    [ -n "$base" ] || base=shell
+fi
+
+# An @-prefixed base means the tab is an ssh wrapper: a split there should be
+# ANOTHER connection to that host, not a local shell wearing a remote name.
+# Numbered wrappers (@myhost.1 → base @myhost) dial the bare host. Pinned
+# wrappers (@myhost.dev) must NOT re-dial the dispatcher alias — that attaches
+# the SAME remote session again and every split becomes a mirror. Instead ask
+# the host for its next sibling name (dev.2) and pin a wrapper to it, so the
+# local name matches the remote session; if the query fails, fall back to a
+# plain host connection (remote auto-attach names it).
+case "$base" in
+@*.*)
+    host="${base#@}"; host="${host%%.*}"; sess="${base#@*.}"
+    if next=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" \
+                  'PATH="$HOME/.local/bin:$PATH" zn -n '"$sess" 2>/dev/null) \
+       && [ -n "$next" ]; then
+        next="${next%$'\r'}"
+        exec env ZS_CREATOR=zp zs --attach "@$host.$next" ssh "$host.$next"
+    fi
+    exec env ZS_CREATOR=zp zs --attach "$(zn -n "@$host")" ssh "$host"
+    ;;
+@*) exec env ZS_CREATOR=zp zs --attach "$(zn -n "$base")" ssh "${base#@}" ;;
+esac
+
+# zs --attach reaps the session when the shell exits (`exit` = done);
+# zn -n provides the base.N numbering shared with the picker's ctrl-n.
+exec env ZS_CREATOR=zp zs --attach "$(zn -n "$base")"

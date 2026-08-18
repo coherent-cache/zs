@@ -1,0 +1,1313 @@
+#!/usr/bin/env bash
+# zs — fzf picker over zmx sessions AND ssh hosts (one launcher for any work
+# context, local or remote — sesh-style flat list, recency-ordered).
+#
+#   zs                       pick once, then return to the caller
+#   zs NAME                  no picker: attach NAME — a session (exact), a
+#                            known host (plain ssh, one layer), or a query
+#                            (user@host / host.sess / new local session)
+#   zs --login               kitty shell entry (via zmx-login): pick; ctrl-c
+#                            falls back to a plain login shell; detach returns
+#                            to the picker; `exit` in a session closes the tab
+#   zs --attach NAME [cmd..] attach NAME (running cmd if new) + reap on end
+#   zs --list [--only=X]     (internal) rows for fzf; X = sessions|hosts
+#   zs --preview TOKEN       (internal) preview pane content
+#   zs --kill TOKEN          (internal) kill a session row
+#
+# List rows (top to bottom): ● attached sessions, ○ detached (newest first),
+# ⇄ recent ssh hosts (last-used first), ⇄ other ssh_config hosts, ✗ ended
+# corpses (dimmed). "· tab N" = open in this kitty.
+#
+# fzf is optional: missing (or older than FZF_MIN) fzf degrades the picker to
+# a plain numbered menu — type a row number, a name, or user@host.
+#
+#   Enter      sessions: GO — focus its kitty tab if open, else attach here.
+#              hosts: UPSERT — resume a detached <host>.N ssh session, else
+#              create one running `ssh <host>`. No match + query: create a
+#              local session (or ssh, if the query looks like user@host).
+#   Alt-Enter  attach HERE regardless (mirror a session open elsewhere)
+#   Ctrl-N     ALWAYS create LOCAL: query name verbatim (never an @ wrapper),
+#              or cwd name (myproj.1) if empty
+#   Tab        complete: host row -> @host. (ready for a session), session
+#              row -> its name
+#   Ctrl-S     drill the selected host: reloads THIS picker with the host's
+#              REMOTE zmx sessions as rows (enter attaches @host.sess); no zmx
+#              / unreachable -> a single row that plain-connects. alt-a/l/r
+#              reload back to the full list.
+#   Space      mark rows; Ctrl-X kills all marked sessions (else the current)
+#   Alt-L/R/A  view: local sessions / remote (wrappers+hosts) / all
+#   Alt-E      toggle exact matching (so ws15 stops matching ws105)
+#   Ctrl-Left/Right  word-wise cursor movement in the query
+#   Ctrl-/     toggle the preview pane
+#   ?          show the full keymap in the preview (footer shows only what fits)
+# The header line updates as you type to show what enter/ctrl-n will do — the
+# @ convention is surfaced, never guessed.
+set -u
+# /opt/homebrew/bin: fzf's home on macOS when launched from GUI kitty's bare
+# PATH; harmless elsewhere.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+RECENTS="$HOME/.cache/zs/recent-hosts"
+HOSTREC=""   # host->recency map (set per-render in list_rows; see _host_recency)
+
+mode=pick
+only=all
+case "${1:-}" in
+    --list)    mode=list; case "${2:-}" in --only=*) only="${2#--only=}";; esac ;;
+    --login)   mode=login ;;
+    --attach)  mode=attach; shift ;;
+    --preview) mode=preview; token="${2:-}" ;;
+    --kill)    mode=kill; token="${2:-}" ;;
+    --kill-multi) mode=killmulti; shift ;;          # kills each s: token in "$@"
+    --actionhint) mode=actionhint; token="${2:-}"; sel="${3:-}"; shift 3 2>/dev/null || shift $# ;; # query, highlighted row, then {+1} marked tokens in "$@"
+    --complete)   mode=complete; token="${2:-}"; query="${3:-}" ;; # tab: complete query/row
+    --exacttoggle) mode=exacttoggle; token="${2:-}" ;; # alt-e: toggle ' prefix
+    --drillbind)  mode=drillbind; token="${2:-}" ;;  # ctrl-s: fzf action for a row
+    --labelbind)  mode=labelbind; token="${2:-}" ;;  # alt-y: scope the list by a row's label
+    --drill-rows) mode=drillrows; token="${2:-}" ;;  # remote sessions of a host, as rows
+    --escbind)    mode=escbind ;;                    # esc: back out of drill, else abort
+    --help-keys)  mode=helpkeys ;;                   # ? : full keymap in the preview
+    --pick-test) mode=picktest; token="${2:-}" ;;   # (tests) run_choice w/o fzf
+    --hop)     mode=hop ;;                          # in-session switch hop (spec 003)
+    --stale)   mode=stale ;;                        # list LOCAL sessions still on old zmx (0.6.0)
+    --classify) mode=classify; token="${2:-}"; query="${3:-}" ;; # (tests) rc + stderr -> failure class
+    --label)   mode=label; token="${2:-}"; shift 2 2>/dev/null || shift $# ;; # get/set 0.7.0 session labels
+    -*) ;;
+    ?*)        mode=direct; token="$1" ;;
+esac
+
+# Bare `zs` INSIDE a session means "switch" (spec 004 FR-004). Attaching from
+# within a session is nested-attach, which spec 003 already resolved as a hop —
+# so the guard message was pure friction on the most common in-session intent.
+# `--hop` stays as an explicit, unconditional alias.
+#
+# $ZMX_SESSION alone is NOT sufficient proof of being in a session: it is
+# inherited by children and goes stale (a detached background agent carries its
+# spawner's value, and the session it names may already be dead). Require an
+# interactive terminal too, so scripts and agents never hop. `[ -t 0 ]` is
+# portable — deliberately NOT `ps -o tty=`, which prints "?" on Linux but "??"
+# on macOS/BSD, a difference that has already produced one shipped bug.
+if [ "$mode" = pick ] && [ "$#" -eq 0 ] && [ -n "${ZMX_SESSION:-}" ] && [ -t 0 ]; then
+    mode=hop
+fi
+
+# The picker leans on --accept-nth (fzf 0.59, Jan 2025); distro fzf is often
+# far older. Anything below FZF_MIN gets the plain-menu fallback instead of
+# fzf erroring out mid-launch.
+FZF_MIN=0.59
+_fzf_ok() {
+    command -v fzf >/dev/null 2>&1 || return 1
+    local v major minor
+    v=$(fzf --version 2>/dev/null); v="${v%% *}"
+    IFS=. read -r major minor _ <<<"$v"
+    case "$major$minor" in *[!0-9]*|'') return 1 ;; esac
+    [ "$major" -gt "${FZF_MIN%%.*}" ] \
+        || { [ "$major" -eq "${FZF_MIN%%.*}" ] && [ "$minor" -ge "${FZF_MIN#*.}" ]; }
+}
+
+# ── kitty remote control (optional; only inside a local kitty) ──────────────
+# Socket-based ONLY (--to): tty-based `kitten @` would fight fzf for the
+# terminal. Regular windows get KITTY_PID but not KITTY_LISTEN_ON — derive.
+_krc() {
+    local to="${KITTY_LISTEN_ON:-}"
+    if [ -z "$to" ] && [ -n "${KITTY_PID:-}" ]; then
+        if [ -S "/tmp/mykitty-$KITTY_PID" ]; then
+            to="unix:/tmp/mykitty-$KITTY_PID"
+        elif [ "$(uname -s)" = Linux ]; then
+            to="unix:@kitty-$KITTY_PID"
+        fi
+    fi
+    [ -n "$to" ] || return 1
+    local k
+    for k in kitten kitty /Applications/kitty.app/Contents/MacOS/kitten; do
+        command -v "$k" >/dev/null 2>&1 && { "$k" @ --to "$to" "$@" 2>/dev/null; return; }
+    done
+    return 1
+}
+
+# All kitty windows currently running `zmx attach X`: "name<TAB>tab_pos<TAB>win_id".
+_kitty_sessions() {
+    [ -n "${KITTY_WINDOW_ID:-}" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    _krc ls | python3 -c '
+import json, sys, os
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for osw in data:
+    for pos, tab in enumerate(osw.get("tabs", []), 1):
+        for w in tab.get("windows", []):
+            for p in w.get("foreground_processes", []):
+                cl = p.get("cmdline") or []
+                if len(cl) >= 3 and os.path.basename(cl[0]) == "zmx" \
+                   and cl[1] in ("attach", "a"):
+                    print("%s\t%s\t%s" % (cl[2], pos, w["id"]))
+'
+}
+
+_kitty_find() {
+    _kitty_sessions | awk -F'\t' -v n="$1" '$1 == n { print $3; exit }' | grep .
+}
+
+# ── diagnostics (spec 004 US1) ───────────────────────────────────────────────
+# Single choke point for "why did that not work". Every abnormal exit and every
+# degraded row routes through here, so no call site invents its own format and
+# nothing can end silently. Goes to stderr: stdout carries picker protocol.
+#
+# PUBLIC-REPO RULE (Constitution IV): messages name the ssh ALIAS only — never a
+# resolved address, tailnet name, or username. Raw ssh stderr is surfaced only
+# for the `unknown` class, only at runtime.
+_zs_err() { printf 'zs: %s\n' "$*" >&2; }
+
+# Classify a failed remote probe from its stderr + exit status. OpenSSH returns
+# 255 for EVERY client-side failure, so the status alone cannot distinguish
+# "key refused" from "host down" — the cause is only in stderr. First match
+# wins; unmatched failures keep their first stderr line rather than collapsing
+# into a generic message (that collapsing is the bug this feature fixes).
+# Echoes: "<class>\t<detail>"  where class is
+# auth-denied | unreachable | no-zmx | empty | unknown
+_classify_ssh_failure() {
+    local rc="$1" err="$2" out="${3:-}" line
+    line=$(printf '%s\n' "$err" | grep -v '^$' | head -1)
+    case "$err" in
+        *"Permission denied"*|*"Too many authentication failures"*|\
+        *"no matching host key"*|*"Host key verification failed"*|\
+        *"no such identity"*)
+            printf 'auth-denied\t%s\n' "key refused" ;;
+        *"Connection timed out"*|*"Connection refused"*|*"No route to host"*|\
+        *"Could not resolve hostname"*|*"Network is unreachable"*|\
+        *"Operation timed out"*|*"port 22: "*)
+            printf 'unreachable\t%s\n' "connection failed" ;;
+        *"command not found"*|*"No such file or directory"*)
+            printf 'no-zmx\t%s\n' "zmx not installed" ;;
+        *)
+            if [ "$rc" -eq 0 ]; then
+                [ -n "$out" ] && printf 'ok\t\n' || printf 'empty\t%s\n' "no sessions"
+            elif [ "$rc" -eq 127 ]; then
+                printf 'no-zmx\t%s\n' "zmx not installed"
+            else
+                printf 'unknown\t%s\n' "${line:-exit $rc}"
+            fi ;;
+    esac
+}
+
+# Is this ssh alias in fact THIS machine? (spec 004 US2)
+# A self entry loops ssh back into the same box and, in the picker, produces a
+# row whose connect fails confusingly. The primary fix ships in the dotfiles
+# ssh templates (a machine no longer renders its own Host stanzas); this is the
+# defensive net for configs chezmoi does not manage (e.g. a self-managed
+# corp config.base).
+# CONSERVATIVE BY DESIGN: only a confident match suppresses a row — when in
+# doubt keep the host, because hiding a legitimate destination is worse than
+# an explained failed connect.
+_ZS_SELF_HN=""
+_is_self_host() {
+    local host="$1" hn target
+    # Memoised: this used to shell out to `hostname` AND `ssh -G` for EVERY host
+    # row on EVERY render — on the corp box that was 15 extra resolutions and
+    # ~3.5s of the 3.6s warm render time. The endpoint is already cached by
+    # _hosts_dedup, so reuse it and only resolve as a last resort.
+    [ -n "$_ZS_SELF_HN" ] || _ZS_SELF_HN=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
+    hn="$_ZS_SELF_HN"
+    [ -n "$hn" ] || return 1
+    [ "$host" = "$hn" ] && return 0
+    target=$(_host_endpoint "$host"); target="${target%%:*}"
+    [ -n "$target" ] || target=$(ssh -G "$host" 2>/dev/null | awk '/^hostname /{print $2; exit}')
+    case "$target" in
+        ''|localhost|127.0.0.1|::1) [ -n "$target" ] && return 0 ;;
+    esac
+    [ -n "$target" ] && [ "$target" = "$hn" ] && return 0
+    return 1
+}
+
+# Stamp provenance labels on a freshly created session (US6). BEST EFFORT by
+# contract: a 0.6.0 daemon rejects `zmx set`, and that must never fail, delay,
+# or warn in a creation flow — the session matters, the metadata does not.
+_zs_label_new() {
+    local name="$1" creator="$2" role="$3"
+    [ -n "$name" ] || return 0
+    zmx set "$name" "creator=$creator" "role=$role" "cwd=${PWD##*/}" >/dev/null 2>&1 || true
+}
+
+# ── session labels (zmx 0.7.0; spec 004 US6) ────────────────────────────────
+# 0.7.0 appends labels to each `zmx list` record as extra tab-separated k=v
+# fields, so they arrive FREE with the listing we already make — no per-row
+# `zmx get`, no extra process on a render (spec 002 SC-007 keeps holding).
+# The same tail also carries non-label bookkeeping, so those keys are excluded
+# BY NAME rather than by position.
+_ZS_RESERVED='ended|exit_code|cmd|name|pid|clients|created|start_dir'
+_labels_of() {
+    local rest="$1" f out=""
+    local oldifs="$IFS"; IFS=$'\t'
+    for f in $rest; do
+        case "$f" in
+            *=*) case "${f%%=*}" in
+                     ended|exit_code|cmd|name|pid|clients|created|start_dir) ;;
+                     *) out="${out:+$out }$f" ;;
+                 esac ;;
+        esac
+    done
+    IFS="$oldifs"
+    printf '%s' "$out"
+}
+
+# Does this session's daemon speak labels (i.e. is it 0.7.0)? Derived from the
+# listing itself where possible: a session carrying any label is provably new.
+# Only sessions with NO labels need the explicit probe, and `zs --stale` (a
+# one-shot, not a render path) is where that cost belongs.
+_has_labels() { [ -n "$(_labels_of "$1")" ]; }
+
+# Version-probe cache. `zmx get` against a pre-0.7.0 daemon fails only after a
+# ~1s client timeout (measured: 1011ms), and the marker probe used to run once
+# per unlabelled session PER RENDER — five stale daemons made every picker
+# open ~5s late (ws15 was carrying 44). A daemon's version can't change under
+# the same pid, so the verdict is cached as "name:pid ok|old" and each daemon
+# is probed exactly once in its lifetime; a recreated session gets a new pid
+# and a fresh probe. Uncached probes run in PARALLEL: the timeout is uniform,
+# so N stale daemons cost ~1s total once, not N seconds every time.
+_ZS_VERCACHE="$HOME/.cache/zs/verprobe"
+_verprobe_fill() {
+    local listing="$1" name _pid clients created dir rest n p tmp
+    local miss=()
+    while IFS=$'\t' read -r name _pid clients created dir rest; do
+        n="${name#*name=}"; p="${_pid#*=}"
+        case "$n" in @*|'') continue ;; esac              # local sessions only
+        case "${rest:-}" in *ended=*) continue ;; esac    # corpses: no probe
+        [ -n "$(_labels_of "${rest:-}")" ] && continue    # labels prove 0.7.0
+        grep -qF -- "$n:$p " "$_ZS_VERCACHE" 2>/dev/null && continue
+        miss+=("$n:$p")
+    done <<< "$listing"
+    [ "${#miss[@]}" -eq 0 ] && return 0
+    mkdir -p "${_ZS_VERCACHE%/*}" 2>/dev/null
+    tmp=$(mktemp) || return 0
+    for np in "${miss[@]}"; do
+        ( if zmx get "${np%%:*}" >/dev/null 2>&1; then
+              printf '%s ok\n'  "$np"
+          else printf '%s old\n' "$np"; fi >> "$tmp" ) &
+    done
+    wait
+    cat "$tmp" >> "$_ZS_VERCACHE" 2>/dev/null; rm -f "$tmp"
+    # prune: drop entries for daemons no longer listed (bounds growth; cheap,
+    # and only runs on the rare render that actually probed something)
+    awk -v L="$listing" 'BEGIN {
+            n = split(L, a, /\n/)
+            for (i = 1; i <= n; i++) {
+                if (match(a[i], /name=[^\t]+/)) {
+                    nm = substr(a[i], RSTART + 5, RLENGTH - 5)
+                    if (match(a[i], /pid=[0-9]+/))
+                        keep[nm ":" substr(a[i], RSTART + 4, RLENGTH - 4)] = 1
+                }
+            }
+        } $1 in keep' "$_ZS_VERCACHE" > "$_ZS_VERCACHE.new" 2>/dev/null \
+        && mv "$_ZS_VERCACHE.new" "$_ZS_VERCACHE" 2>/dev/null
+}
+
+# ── row sources ──────────────────────────────────────────────────────────────
+_ago() {
+    local d=$(( $(date +%s) - $1 ))
+    if   [ "$d" -lt 3600 ];  then printf '%dm ago' $((d / 60))
+    elif [ "$d" -lt 86400 ]; then printf '%dh ago' $((d / 3600))
+    else                          printf '%dd ago' $((d / 86400))
+    fi
+}
+
+# Strip ANSI/OSC/control noise so a session preview reads as plain text even
+# when its scrollback holds a TUI. Literal ESC via $e keeps this portable
+# across GNU and BSD sed (no \x escapes).
+_ansi_strip() {
+    local e; e=$(printf '\033')
+    LC_ALL=C sed -e "s/${e}\[[0-9;?]*[ -/]*[@-~]//g" \
+                 -e "s/${e}\][^${e}$(printf '\007')]*\($(printf '\007')\|${e}\\\\\)//g" \
+                 -e "s/${e}[()][A-Za-z0-9]//g" \
+                 -e "s/${e}[=>]//g" \
+                 -e 's/\r//g'
+}
+
+# Effective host recency (FR-013): host -> newest of {recents-file ts, any
+# @host.* session created=, NOW if any @host.* is attached}. Emits
+# "host<TAB>ts". Pure read (zmx list + recents file); no writes, no network.
+# The coupling: working in @ws105.bld lifts ws105 in the host band even with
+# no bare-connect entry.
+_host_recency() {
+    # $1: the render's listing snapshot (005 C1 — no scan of its own)
+    local snapshot="$1" now; now=$(date +%s)
+    {
+        [ -r "$RECENTS" ] && awk -F'\t' 'NF>=2 {print $2"\t"$1}' "$RECENTS"
+        [ -n "$snapshot" ] && printf '%s\n' "$snapshot" | while IFS=$'\t' read -r name _pid clients created _rest; do
+            n="${name#*name=}"
+            case "$n" in
+            @*) h="${n#@}"; h="${h%%.*}"
+                c="${clients#*=}"; t="${created#*=}"; t="${t%$'\r'}"
+                [ "$c" != 0 ] && t=$now
+                [ -n "$h" ] && printf '%s\t%s\n' "$h" "$t" ;;
+            esac
+        done
+    } | awk -F'\t' '{ v=$2+0; if (v > m[$1]) m[$1]=v } END { for (h in m) print h"\t"m[h] }'
+}
+_rec_of() { printf '%s\n' "$HOSTREC" | awk -F'\t' -v h="$1" '$1==h {print $2; exit}'; }
+
+# Session rows, locality-first (FR-011). Emits 5 fields:
+#   LOC<TAB>GROUP<TAB>SORTKEY<TAB>s:NAME<TAB>display
+# LOC: l (local project.N) | r (remote @host.* wrapper). GROUP bands:
+#   1 local attached · 2 local detached · 3 remote wrappers (by host) ·
+#   8 corpses. Remote-wrapper SORTKEY is the host's effective recency
+#   (FR-013) so wrappers cluster by host, newest-active host first; local
+#   rows sort by created. list_rows filters on LOC and cuts to fields 4-.
+# zmx list: gutter first field ("  name=X" / "→ name=X"), then pid= clients=
+#   created= start_dir= [ended= exit_code=] tab-separated.
+_session_rows() {
+    # $1: the render's listing snapshot (005 C1/C2 — the ONLY listing input)
+    local listing="$1"
+    local dups kmap e reap_cutoff n c t L hh g m sk loc pos w lbl chips ver
+    reap_cutoff=$(( $(date +%s) - 7*86400 ))
+    # dup names derived from the snapshot: byte-equivalent to the former
+    # `zmx list --short` (the name column), minus a whole second scan
+    dups=$(printf '%s\n' "$listing" \
+        | awk -F'\t' 'NF { n = $1; sub(/.*name=/, "", n); print n }' \
+        | tr -d '\r' | sort | uniq -d)
+    kmap=$(_kitty_sessions 2>/dev/null || true)
+    _verprobe_fill "$listing"
+    local reap_batch=""
+    [ -n "$listing" ] && printf '%s\n' "$listing" | { while IFS=$'\t' read -r name _pid clients created dir rest; do
+        n="${name#*name=}"
+        c="${clients#*=}"
+        t="${created#*=}"
+        case "$n" in @*) L=r; hh="${n#@}"; hh="${hh%%.*}" ;; *) L=l; hh="" ;; esac
+        case "${rest:-}" in
+            *ended=*)
+                # corpses ended >7 days ago are reaped at picker start instead
+                # of rendered. ended= corpses ONLY — a detached session is NOT
+                # dead, never touch it.
+                e="${rest#*ended=}"; e="${e%%$'\t'*}"; e="${e%$'\r'}"
+                if [ -n "$e" ] && [ -z "${e//[0-9]/}" ] \
+                   && [ "$e" -lt "$reap_cutoff" ]; then
+                    reap_batch="$reap_batch $n"   # suppress now, kill after the loop
+                    continue
+                fi
+                g=8; m="✗"; sk="$t" ;;
+            *) if [ "$L" = r ]; then
+                   # cluster by host recency; within a cluster, attached first
+                   # then newest (decimal part: <attached-flag><created>)
+                   g=3; sk=$(_rec_of "$hh"); sk="${sk:-$t}"
+                   if [ "$c" = 0 ]; then sk="$sk.0$t"; else sk="$sk.1$t"; fi
+               elif [ "$c" = 0 ]; then g=2; sk="$t"
+               else g=1; sk="$t"; fi
+               if [ "$c" = 0 ]; then m="○"; else m="●$c"; fi ;;
+        esac
+        loc=""
+        if [ -n "$kmap" ]; then
+            pos=$(awk -F'\t' -v n="$n" '$1 == n { print $2; exit }' <<<"$kmap")
+            [ -n "$pos" ] && loc="  · tab $pos"
+        fi
+        w=""
+        [ -n "$dups" ] && printf '%s\n' "$dups" | grep -qx "$n" && w="  ⚠ duplicate name"
+        # version marker (migration aid): a LOCAL session whose daemon can't do
+        # 0.7.0 labels (`zmx get` fails) is still on 0.6.0 — flag it, since a
+        # 0.7.0 client on a 0.6.0 server breaks multi-client rendering. Local
+        # only: probing every remote drill row would add an ssh per row.
+        # Label chips (US6) + version marker. Both come from the listing we
+        # already have: labels prove a 0.7.0 daemon; unlabelled sessions were
+        # probed ONCE by _verprobe_fill above and answer from the cache here —
+        # a render never blocks on a daemon timeout (SC-007).
+        lbl=$(_labels_of "${rest:-}")
+        chips=""; [ -n "$lbl" ] && chips=$'  \033[2m['"$lbl"$']\033[0m'
+        ver=""
+        if [ "$L" = l ] && [ "$g" != 8 ] && [ -z "$lbl" ]; then
+            case "$(grep -F -m1 -- "$n:${_pid#*=} " "$_ZS_VERCACHE" 2>/dev/null)" in
+                *' old') ver=$'  \033[33m⚠0.6\033[0m' ;;
+            esac
+        fi
+        if [ "$g" = 8 ]; then
+            # corpses keep their chips: a labelled corpse (a finished zn job,
+            # say) must stay findable via --only=label: and show provenance
+            printf "%s\t%s\t%s\ts:%s\t\033[2m%-22s\t✗    %s (ended)%s\033[0m\n" \
+                "$L" "$g" "$sk" "$n" "$n" "${dir#*=}" "$chips"
+        else
+            printf "%s\t%s\t%s\ts:%s\t%-22s\t%-3s  %s%s%s%s%s\n" \
+                "$L" "$g" "$sk" "$n" "$n" "$m" "${dir#*=}" "$loc" "$w" "$chips" "$ver"
+        fi
+    done
+    # 005 C3: ONE batched, fire-and-forget kill for every reap-eligible corpse
+    # — the render never waits on it (the inline sequential version froze a
+    # 29-corpse backlog render for 52.8s against legacy daemons). ZS_REAP_WAIT
+    # is the test-determinism hook (C4); the dispatch path is otherwise
+    # identical. Word-splitting $reap_batch is safe: names cannot contain
+    # whitespace or the tab-separated listing could not have parsed them.
+    if [ -n "$reap_batch" ]; then
+        ( zmx kill $reap_batch >/dev/null 2>&1 &
+          [ -n "${ZS_REAP_WAIT:-}" ] && wait )
+    fi ; }
+}
+
+# Concrete ssh config hosts, deduped by resolved endpoint: aliases like
+# web/web-server-01 resolve to one hostname:port — keep the FIRST-listed name
+# (reorder aliases on the Host line to change which is shown). ssh -G costs
+# ~10ms/host, so the result is cached and refreshed when any config changes.
+# Every ssh config file that defines hosts: the usual ones PLUS anything they
+# Include. Without following Include, a machine whose hosts live in an included
+# file shows ZERO host rows — which is exactly what happened on the corp WSL box
+# (all 19 lab hosts sat in an Included config.base, so the picker offered
+# nothing to drill into). One level deep is enough for real layouts and cannot
+# recurse. Relative paths resolve against ~/.ssh, per ssh_config(5).
+_ssh_config_files() {
+    local f g inc
+    for f in ~/.ssh/config ~/.ssh/config.d/*; do
+        [ -f "$f" ] || continue
+        printf '%s\n' "$f"
+        while read -r inc; do
+            [ -n "$inc" ] || continue
+            case "$inc" in
+                /*) ;;
+                "~/"*) inc="$HOME/${inc#\~/}" ;;
+                *) inc="$HOME/.ssh/$inc" ;;
+            esac
+            for g in $inc; do [ -f "$g" ] && printf '%s\n' "$g"; done
+        done < <(awk '{ sub(/\r$/, "") } tolower($1) == "include" { for (i = 2; i <= NF; i++) { v = $i; sub(/\r$/, "", v); print v } }' "$f" 2>/dev/null)
+    done 2>/dev/null | awk '!seen[$0]++'
+}
+
+_hosts_dedup() {
+    local cache="$HOME/.cache/zs/hosts" f names host ep seen cfgs
+    cfgs=$(_ssh_config_files)
+    for f in $cfgs; do
+        [ -e "$f" ] && [ "$f" -nt "$cache" ] && { rm -f "$cache"; break; }
+    done 2>/dev/null
+    if [ ! -r "$cache" ]; then
+        mkdir -p "${cache%/*}"
+        # NEVER let awk run with an empty file list — with no operands it reads
+        # STDIN and swallows the caller's input (this broke the hop tests, whose
+        # sandbox has no ssh config at all).
+        names=""
+        [ -n "$cfgs" ] && names=$(awk '{ sub(/\r$/, "") }
+                    /^[Hh]ost[ \t]/ { for (i = 2; i <= NF; i++) {
+                        v = $i; sub(/\r$/, "", v)
+                        if (v !~ /[*?%!]/ && v != "") print v } }' \
+                    $cfgs 2>/dev/null | awk '!seen[$0]++')
+        # Resolve ALL names in PARALLEL first. ssh -G is pure local config work,
+        # but its cost is wildly uneven (measured on the corp box: 35 names,
+        # most <30ms, one 2.4s) and sequentially that made a cold render take
+        # 36 SECONDS. Fanning out bounds it by the slowest single name.
+        local pardir; pardir=$(mktemp -d "${TMPDIR:-/tmp}/zs-res.XXXXXX") || pardir=""
+        if [ -n "$pardir" ]; then
+            local i=0
+            while IFS= read -r host; do
+                [ -n "$host" ] || continue
+                i=$((i + 1))
+                ( printf '%s\t%s\n' "$host" \
+                    "$(ssh -G "$host" 2>/dev/null | awk '/^hostname /{h=$2} /^port /{p=$2} END{print h":"p}')" \
+                    > "$pardir/$i" ) &
+            done <<<"$names"
+            wait
+            # Re-assemble in ORIGINAL config order (files are named by index).
+            # Sorting by host name would break "first-listed alias wins" dedup.
+            names=$(for n in $(ls "$pardir" 2>/dev/null | sort -n); do cat "$pardir/$n"; done)
+            rm -rf "$pardir"
+        fi
+        seen=""
+        while IFS=$'\t' read -r host ep; do
+            [ -n "$host" ] || continue
+            [ -n "${ep:-}" ] || ep=$(ssh -G "$host" 2>/dev/null | awk '/^hostname /{h=$2} /^port /{p=$2} END{print h":"p}')
+            case " $seen " in *" $ep "*) continue ;; esac
+            seen="$seen $ep"
+            # Store the endpoint we just paid for. Resolving is the expensive
+            # part of a render (35 names on the corp box, one of them 2.4s), so
+            # nothing downstream may re-resolve.
+            printf '%s\t%s\n' "$host" "$ep"
+        done <<<"$names" > "$cache.tmp" && mv "$cache.tmp" "$cache"
+    fi
+    cut -f1 "$cache" 2>/dev/null
+}
+
+# Endpoint for a host, from the cache _hosts_dedup already built. Never resolves.
+_host_endpoint() { awk -F'\t' -v h="$1" '$1 == h { print $2; exit }' "$HOME/.cache/zs/hosts" 2>/dev/null; }
+
+# Host rows (LOC=r, band 5), ordered by EFFECTIVE host recency (FR-013): a
+# host active via any @host.* session floats up even with no bare-connect
+# entry. Emits "r<TAB>5<TAB>SORTKEY<TAB>h:HOST<TAB>display". Hosts with signal
+# show "⇄ Nm ago"; the rest sort at key 0 (config order via stable sort).
+_host_rows() {
+    local all host ts
+    all=$(_hosts_dedup)
+    [ -n "$all" ] || return 0
+    # Display carries the @ prefix (a host row IS a potential @host
+    # connection): consistent with the wrapper/drill rows, and @-led queries
+    # (tab completion) keep matching the raw host row.
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        # never offer this machine to itself (US2 defensive net; the primary
+        # fix is the ssh templates no longer rendering a machine's own stanzas)
+        _is_self_host "$host" && continue
+        ts=$(_rec_of "$host")
+        if [ -n "$ts" ] && [ "$ts" -gt 0 ] 2>/dev/null; then
+            printf "r\t5\t%s\th:%s\t%-22s\t⇄    %s\n" "$ts" "$host" "@$host" "$(_ago "$ts")"
+        else
+            printf "r\t5\t0\th:%s\t%-22s\t⇄\n" "$host" "@$host"
+        fi
+    done <<<"$all"
+}
+
+_record_recent() {
+    mkdir -p "${RECENTS%/*}"
+    { printf '%s\t%s\n' "$(date +%s)" "$1"
+      grep -v $'\t'"$1"'$' "$RECENTS" 2>/dev/null; } | head -50 > "$RECENTS.tmp" \
+        && mv "$RECENTS.tmp" "$RECENTS"
+}
+
+# Bounded remote zmx invocation on a host (drill rows / previews / kills).
+# /usr/local/bin covers hosts where zmx is symlinked for non-login ssh.
+# Run zmx on a remote host. stdout = payload (as before). The failure CAUSE is
+# no longer discarded: stderr + exit status are captured and classified into
+# ZS_REMOTE_CLASS / ZS_REMOTE_DETAIL for the caller (spec 004 US1). The old
+# `2>/dev/null` is exactly what made an auth refusal indistinguishable from a
+# dead host — and, with a warm connection-sharing master, indistinguishable
+# from success.
+ZS_REMOTE_CLASS=""; ZS_REMOTE_DETAIL=""
+ZS_REMOTE_STATE="${TMPDIR:-/tmp}/zs-rstate.$$"
+_remote_zmx() {
+    local host="$1"; shift
+    local errf out rc
+    errf=$(mktemp "${TMPDIR:-/tmp}/zs-rerr.XXXXXX") || errf=/dev/null
+    out=$(ssh -n -o BatchMode=yes -o ConnectTimeout=3 "$host" \
+        'PATH="$HOME/.local/bin:/usr/local/bin:$PATH" zmx '"$*" 2>"$errf")
+    rc=$?
+    local err=""; [ -s "$errf" ] && err=$(cat "$errf")
+    [ "$errf" != /dev/null ] && rm -f "$errf"
+    # Callers invoke this inside $( … ), i.e. a SUBSHELL — plain variable
+    # assignments would not survive. Hand the classification back through a
+    # file and let the caller pick it up with _remote_state.
+    _classify_ssh_failure "$rc" "$err" "$out" > "$ZS_REMOTE_STATE" 2>/dev/null
+    printf '%s' "$out"
+    [ "$rc" -eq 0 ]
+}
+
+# Load the classification of the most recent _remote_zmx into
+# ZS_REMOTE_CLASS / ZS_REMOTE_DETAIL (safe across the subshell boundary).
+_remote_state() {
+    ZS_REMOTE_CLASS=""; ZS_REMOTE_DETAIL=""
+    [ -r "$ZS_REMOTE_STATE" ] || return 0
+    IFS=$'\t' read -r ZS_REMOTE_CLASS ZS_REMOTE_DETAIL < "$ZS_REMOTE_STATE"
+}
+
+# US4/FR-010 — drill view rows: a host's REMOTE zmx sessions, one r:HOST.SESS
+# row each. r: tokens make the row's remote-ness explicit to every consumer:
+# enter attaches the @HOST.SESS wrapper, preview shows the REMOTE session's
+# history, ctrl-x kills the REMOTE session (all bounded ssh). Lazy — runs only
+# on ctrl-s / drill-view reloads, never on picker open (SC-007). No zmx /
+# unreachable / empty -> ONE h: fallback row that plain-connects (SC-006).
+_drill_rows() {
+    local host="$1" remote n c m msg
+    # Full list, not --short: --short includes ENDED sessions with nothing to
+    # tell them apart — the drill must render corpses dimmed ✗ exactly like
+    # the top level, or a dead remote session masquerades as attachable.
+    remote=$(_remote_zmx "$host" list | tr -d '\r' | grep .)
+    _remote_state   # recover the failure class from the subshell
+    if [ -n "$remote" ]; then
+        printf '%s\n' "$remote" | while IFS=$'\t' read -r name _pid clients _created _dir rest; do
+            n="${name#*name=}"
+            [ -n "$n" ] || continue
+            c="${clients#*=}"
+            case "${rest:-}" in
+            *ended=*)
+                printf 'r:%s.%s\t\033[2m%-22s\t✗    ended on %s\033[0m\n' \
+                    "$host" "$n" "@$host.$n" "$host" ;;
+            *)
+                if [ "$c" = 0 ] 2>/dev/null || [ -z "$c" ]; then m="○"; else m="●$c"; fi
+                printf 'r:%s.%s\t%-22s\t%-3s  ⇲ on %s\n' "$host" "$n" "@$host.$n" "$m" "$host" ;;
+            esac
+        done
+    else
+        # Class-specific fallback (spec 004 FR-002): the operator must be able to
+        # tell "your key was refused" from "the host is down" from "zmx isn't
+        # installed" WITHOUT experimenting. Alias only — never the address.
+        case "${ZS_REMOTE_CLASS:-}" in
+            auth-denied) msg="⚠ auth refused — connect interactively for password" ;;
+            unreachable) msg="⚠ unreachable — connection failed (timeout/refused)" ;;
+            no-zmx)      msg="⚠ no zmx on $host — enter connects plainly" ;;
+            empty|ok)    msg="○ no sessions yet — enter connects, ctrl-n creates" ;;
+            unknown)     msg="⚠ error — ${ZS_REMOTE_DETAIL:-unknown}" ;;
+            *)           msg="⚠ no zmx / unreachable — enter connects plainly" ;;
+        esac
+        printf 'h:%s\t%-22s\t%s\n' "$host" "@$host" "$msg"
+    fi
+}
+
+# Locality-first assembly (FR-011/FR-012). Rows: LOC GROUP SORTKEY TOKEN DISPLAY.
+# HOSTREC (effective host recency) is computed ONCE here and read by the row
+# sources via _rec_of — no network, no per-row recompute. Filter cuts on LOC:
+#   local  -> band 1/2 local sessions only
+#   remote -> remote wrappers (band 3) + hosts (band 5)
+#   all    -> everything. Then sort GROUP asc, SORTKEY desc; cut to TOKEN,DISPLAY.
+list_rows() {
+    local HOSTREC lv SNAPSHOT
+    # ONE listing per render (005 C1): recency, dup detection, verprobe
+    # candidacy and rows all derive from THIS capture. Three separate scans
+    # used to run here — each paying full daemon-aggregation latency (0.76s
+    # on a box with legacy daemons) and able to disagree mid-render.
+    SNAPSHOT=$(zmx list 2>/dev/null)
+    HOSTREC=$(_host_recency "$SNAPSHOT")
+    {
+        _session_rows "$SNAPSHOT"
+        [ "$only" != local ] && _host_rows   # hosts are remote-only
+    } | awk -F'\t' -v only="$only" '
+            only=="local"  && $1!="l" { next }
+            only=="remote" && $1!="r" { next }
+            { print }
+        ' | sort -t$'\t' -s -k2,2n -k3,3nr | cut -f4- \
+          | { case "$only" in
+                label:*) # a chip is "[k=v k=v …]" and zmx lists labels SORTED,
+                         # so creator= renders before role= on every zs-stamped
+                         # session — the label must match at ANY position, and
+                         # only delimiter-bounded (role=x must not hit role=xy)
+                         lv="${only#label:}"
+                         grep -F -e "[${lv}]" -e "[${lv} " -e " ${lv}]" -e " ${lv} " || true ;;
+                *)       cat ;;
+              esac; }
+    # Rows are TOKEN <tab> NAME <tab> DECOR, emitted directly by the row
+    # sources. NAME is the padded, displayed name column AND the only text fzf
+    # searches; DECOR (markers/dir/age) is displayed but never matched.
+    # CRITICAL fzf semantics (regression 2026-08-03, caught live): when
+    # --with-nth is present, --nth indexes the TRANSFORMED line, not the
+    # original fields — so pick() shows {2,3} and scopes search to nth=1
+    # (= NAME within the transformed line). A --nth pointing at a field that
+    # doesn't exist post-transform silently matches NOTHING for every query.
+}
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+auto_name() {
+    local base
+    base="${PWD##*/}"
+    [ "$PWD" = "$HOME" ] && base=home
+    base="${base//[^A-Za-z0-9._-]/-}"
+    [ -n "$base" ] || base=shell
+    zn -n "$base"
+}
+
+# Newest detached, non-ended session named <base>.N — the resume candidate.
+_resume_candidate() {
+    zmx list 2>/dev/null | awk -F'\t' -v b="$1" '
+        {
+            name = $1; sub(/.*name=/, "", name)
+            if (name !~ ("^" b "\\.[0-9]+$")) next
+            free = 0; ended = 0; created = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i == "clients=0")   free = 1
+                if ($i ~ /^ended=/)      ended = 1
+                if ($i ~ /^created=/) { created = $i; sub(/^created=/, "", created) }
+            }
+            if (free && !ended && created + 0 > best) { best = created + 0; pick = name }
+        }
+        END { if (pick) print pick }' | grep .
+}
+
+# Attach (create-or-attach, optionally with a command for new sessions) and
+# reap the ended corpse if the process exits — `exit`/dead ssh = done (0);
+# detach keeps the session and returns 1 (caller may re-show the picker).
+#
+# Switch hop (spec 003): `zs --hop` inside the session writes its selection to
+# the per-session handoff and detaches; when the attach returns we consume the
+# handoff and dispatch the target instead of returning — the client MOVES
+# (origin keeps running detached, attach depth stays 1). Consumed exactly
+# once: read + unlink before dispatch. No handoff = the pre-003 behavior.
+attach_run() {
+    local s="$1"; shift
+    # ZS_CREATOR lets the tool the operator actually invoked own the label:
+    # zp execs `zs --attach`, so without this every split reads creator=zs.
+    case "$s" in
+        @*) _zs_label_new "$s" "${ZS_CREATOR:-zs}" wrapper ;;
+        *)  _zs_label_new "$s" "${ZS_CREATOR:-zs}" shell ;;
+    esac
+    printf '\033]2;%s\007' "$s" > /dev/tty
+    local t0=$SECONDS
+    zmx attach "$s" "$@"
+    local hopf="${XDG_RUNTIME_DIR:-/tmp}/zs-hop.$s" tok
+    if [ -f "$hopf" ]; then
+        tok=$(head -1 "$hopf" 2>/dev/null); rm -f "$hopf"
+        if [ -n "$tok" ]; then
+            run_choice go "$tok"
+            return
+        fi
+    fi
+    if zmx list 2>/dev/null | awk -F'\t' -v s="$s" '
+        { n = $1; sub(/.*name=/, "", n)
+          if (n == s) for (i = 1; i <= NF; i++) if ($i ~ /^ended=/) { found = 1; exit } }
+        END { exit !found }'; then
+        zmx kill "$s" >/dev/null 2>&1
+        # A WRAPPED connect (ssh ...) that died within a couple seconds almost
+        # certainly failed to establish (bad user/host/key, refused). Say so —
+        # otherwise the session reap + screen restore swallow the error and it
+        # "just exits". `zmx attach` returns 0 regardless, and `list`'s
+        # exit_code= is the run-marker task code (not this command's wait
+        # status), so time-to-death is the honest signal we have.
+        if [ "$#" -gt 0 ] && [ $(( SECONDS - t0 )) -lt 3 ]; then
+            printf 'zs: "%s" closed immediately — likely could not connect. Run it in a shell to see the error.\n' "$*" >&2
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# @-named sessions must never be born as LOCAL shells: a local prompt inside
+# one would render the starship tag as [laptop.@myhost.1] — two hosts in one
+# host.session tag. If the session exists this attaches like attach_run; if
+# it's gone (ssh ended elsewhere, corpse reaped, or ctrl-n typed an @ name),
+# re-create it by connecting — the name IS the connection spec:
+#   @host.N      → ssh host          (numbered wrapper)
+#   @host.sess   → ssh host.sess     (remote-pinned, rides the dispatcher)
+#   @host.sess.N → ssh host.sess.N   (pinned sibling from zp splits)
+#   @host        → ssh host
+attach_wrapper() {
+    local s="$1" spec="${1#@}" last rest
+    last="${spec##*.}" rest="${spec%.*}"
+    if [ "$last" != "$spec" ] && [ -z "${last//[0-9]/}" ] \
+       && [ "${rest#*.}" = "$rest" ]; then
+        attach_run "$s" ssh "$rest"      # @host.N → ssh host
+    else
+        attach_run "$s" ssh "$spec"      # @host / @host.sess / @host.sess.N
+    fi
+}
+
+# ── fzf round ────────────────────────────────────────────────────────────────
+# No usable fzf: number the same rows on stderr and read one line from stdin
+# (the terminal, in every interactive path) — a row number, a session name
+# (attach-or-create), a host, or user@host. Empty input / EOF cancels (130).
+# Menu on stderr, result on stdout, same contract as pick().
+fallback_pick() {
+    local rows tok disp sel i=0
+    local -a tokens
+    rows=$(list_rows)
+    echo "zs: fzf >= $FZF_MIN not found — plain menu (install fzf for the full picker)" >&2
+    if [ -n "$rows" ]; then
+        while IFS=$'\t' read -r tok _key disp; do
+            i=$((i + 1)); tokens[i]=$tok
+            printf '%3d  %s %s\n' "$i" "$_key" "$disp" >&2
+        done <<<"$rows"
+    else
+        # empty view: say so and what typing will do (FR-006 / FR-010 parity)
+        echo "zs: no sessions and no configured ssh hosts — type a name to create one" >&2
+    fi
+    read -rp 'zs (number | name | host | user@host)> ' sel || return 130
+    [ -n "$sel" ] || { _zs_err "nothing selected"; return 130; }
+    case "$sel" in
+    *[!0-9]*)
+        if [ -n "${tokens[*]:-}" ]; then
+            for tok in "${tokens[@]}"; do
+                [ "$tok" = "s:$sel" ] || [ "$tok" = "h:$sel" ] || continue
+                printf 'go\t%s\n' "$tok"; return 0
+            done
+        fi
+        printf 'go\tq:%s\n' "$sel" ;;
+    *)
+        [ "$sel" -ge 1 ] && [ "$sel" -le "$i" ] || return 130
+        printf 'go\t%s\n' "${tokens[sel]}" ;;
+    esac
+}
+
+# A SINGLE-line footer sized to the space it actually gets. With a
+# side-by-side preview the footer sits in the ~half-width list column (fzf has
+# no full-width-under-preview footer, and no live-resize footer hook), so pack
+# key hints in priority order until they'd exceed that width — more on a wide
+# terminal, fewer on a narrow one, never wrapping or spilling into the preview.
+# Matches the picker's own layout: preview is right,50% at >=90 cols else down.
+_footer_line() {
+    local cols=$1 fw seg cand out=""
+    if [ "$cols" -lt 90 ]; then fw=$((cols - 4)); else fw=$((cols / 2 - 5)); fi
+    [ "$fw" -lt 12 ] && fw=12
+    for seg in "enter go" "? help" "ctrl-n new" "tab complete" "ctrl-s drill" \
+               "ctrl-x kill" "alt-l/r/a view" "alt-y label" "alt-e exact" \
+               "ctrl-/ preview"; do
+        cand="${out:+$out · }$seg"
+        [ "${#cand}" -le "$fw" ] || break
+        out="$cand"
+    done
+    printf '%s' "$out"
+}
+
+# Prints "go<TAB>TOKEN" or "here<TAB>TOKEN" (TOKEN: s:name | h:host | q:query),
+# or returns 130 on cancel. Rows are TAB-sep: field1 = action token (returned
+# by --accept-nth, which reads ORIGINAL fields), field2 = padded name column,
+# field3 = decorations (markers/dir/age — displayed, never searched).
+# fzf gotcha (live-caught 2026-08-03): with --with-nth present, --nth indexes
+# the TRANSFORMED line. We show {2,3} and search nth=1 — the name column within
+# the transformed line — so decorations can't match ("bld.1" never matches a
+# stray "1" in a client count) and a bad index can't silently match nothing.
+pick() {
+    local display output rc query key selected cols footer
+    _fzf_ok || { fallback_pick; return; }
+    # Terminal width for footer sizing — from the tty (stdout here is captured),
+    # falling back to COLUMNS then 80.
+    cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
+    case "$cols" in ''|*[!0-9]*) cols="${COLUMNS:-80}" ;; esac
+    footer=$(_footer_line "$cols")
+    printf '\033]2;zmx\007' > /dev/tty
+    display=$(list_rows)
+    output=$({ [ -n "$display" ] && printf '%s\n' "$display"; } | fzf \
+        --ansi --no-sort --track \
+        --print-query \
+        --expect=ctrl-n,alt-enter \
+        --delimiter=$'\t' --with-nth=2,3 --nth=1 --accept-nth=1 \
+        --multi \
+        --bind 'space:toggle+down' \
+        --bind 'enter:clear-selection+accept' \
+        --bind 'ctrl-x:execute-silent(zs --kill-multi {+1})+clear-selection+reload(zs --list --only=current)' \
+        --bind 'alt-l:change-prompt(local> )+reload(zs --list --only=local)' \
+        --bind 'alt-r:change-prompt(remote> )+reload(zs --list --only=remote)' \
+        --bind 'alt-a:change-prompt(zmx> )+reload(zs --list --only=all)' \
+        --bind 'alt-y:transform(zs --labelbind {1})' \
+        --bind 'ctrl-s:transform(zs --drillbind {1})' \
+        --bind 'tab:transform(zs --complete {1} {q})' \
+        --bind 'ctrl-left:backward-word' --bind 'ctrl-right:forward-word' \
+        --bind 'alt-e:transform-query(zs --exacttoggle {q})' \
+        --bind 'start:transform-header(zs --actionhint {q} {1} {+1})' \
+        --bind 'change:transform-header(zs --actionhint {q} {1} {+1})' \
+        --bind 'focus:transform-header(zs --actionhint {q} {1} {+1})' \
+        --bind '?:show-preview+preview(zs --help-keys)' \
+        --bind 'esc:transform(zs --escbind)' \
+        --bind 'ctrl-/:toggle-preview' \
+        --height=80% --min-height=15 \
+        --reverse \
+        --info=inline-right --no-separator \
+        --prompt="zmx> " \
+        --header-first \
+        --footer="$footer" \
+        --footer-border=line \
+        --preview='zs --preview {1}' \
+        --preview-window='right,50%,follow,<90(down,45%,follow)')
+    rc=$?
+    query=$(sed -n 1p <<<"$output")
+    key=$(sed -n 2p <<<"$output")
+    selected=$(sed -n 3p <<<"$output")
+    # A leading ' is fzf's exact-search token (alt-e precision toggle), not part
+    # of the intended name — strip it before it becomes an attach target.
+    query="${query#\'}"
+
+    case "$key" in
+    ctrl-n)
+        # LITERAL create (FR-001): the typed name, verbatim — never
+        # reclassified into an @ wrapper. Empty query -> cwd auto-name.
+        if [ -n "$query" ]; then printf 'here\ts:%s\n' "$query"
+        else printf 'here\ts:%s\n' "$(auto_name)"; fi
+        return 0 ;;
+    alt-enter)
+        if [ -n "$selected" ]; then printf 'here\t%s\n' "$selected"
+        elif [ -n "$query" ]; then printf 'here\tq:%s\n' "$query"
+        else return 130; fi
+        return 0 ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ -n "$selected" ]; then
+        printf 'go\t%s\n' "$selected"; return 0
+    fi
+    if [ "$rc" -le 1 ] && [ -n "$query" ]; then
+        printf 'go\tq:%s\n' "$query"; return 0
+    fi
+    return 130
+}
+
+# Act on a pick. Returns 0 when this tab is done (focused away or session
+# ended), 1 when the session was detached (picker may re-show).
+run_choice() {
+    local action="$1" token="$2" name host target win rc_ssh
+    case "$token" in
+    r:*)
+        # Drill-view row: a REMOTE session on a host. Attaching goes through
+        # the ordinary @HOST.SESS wrapper path (kitty focus and all).
+        host="${token#r:}"; host="${host%%.*}"
+        _record_recent "$host"
+        run_choice "$action" "s:@${token#r:}"
+        ;;
+    s:*)
+        name="${token#s:}"
+        if [ "$action" = go ] && win=$(_kitty_find "$name"); then
+            _krc focus-window --match "id:$win" >/dev/null && return 0
+        fi
+        case "$name" in
+        @*) attach_wrapper "$name" ;;
+        *)  attach_run "$name" ;;
+        esac
+        ;;
+    h:*)
+        # spec 003 US3 [Δ002]: the host row matches `ssh host` — plain connect,
+        # ONE layer (the remote auto-attach resumes/creates its default
+        # session), no surprise local wrapper. The @host.N wrapper remains an
+        # EXPLICIT choice: type/tab @host (q:@ below) or `zp --host`.
+        # Return 1 always: ssh can't distinguish remote detach from exit, and
+        # "back to the picker" is the browse-mode expectation either way.
+        host="${token#h:}"
+        _record_recent "$host"
+        printf '\033]2;%s\007' "$host" > /dev/tty
+        if _is_self_host "$host"; then
+            _zs_err "$host is this machine — refusing circular connect"
+            return 1
+        fi
+        ssh "$host"
+        rc_ssh=$?
+        # 255 = ssh ITSELF failed (auth/network), not a remote logout. ssh has
+        # already printed its own error; add the zs-level next step so the
+        # operator is not left staring at a picker that just blinked (FR-001).
+        [ "$rc_ssh" -eq 255 ] && \
+            _zs_err "$host: connection failed (see the ssh error above) — if the key was refused, connect interactively to use a password"
+        return 1
+        ;;
+    q:*)
+        name="${token#q:}"
+        case "$name" in
+        @*.*)  # @-led typed name. First segment a KNOWN host -> dispatcher
+               # wrapper spec (@ws15.mesh -> ssh ws15.mesh). Otherwise the dots
+               # belong to the host itself (an IP or FQDN: @1.2.3.4 /
+               # @box.example.com) -> treat the WHOLE thing as one bare host and
+               # plain-connect. Never split an UNKNOWN host on its own dots:
+               # that shredded @1.2.3.4 into host="1", ssh'd the whole IP as
+               # user $USER with no config, and reaped itself silently.
+            spec="${name#@}"
+            if _hosts_dedup | grep -qx -- "${spec%%.*}"; then
+                _record_recent "${spec%%.*}"
+                attach_wrapper "$name"
+            else
+                run_choice "$action" "h:$spec"
+            fi
+            ;;
+        @*)    # bare @host: the EXPLICIT local-wrapper request (spec 003 US3 —
+               # the plain host row now plain-connects; the @ spelling is how
+               # you ask for local picker visibility + zp semantics). Resume
+               # the newest detached @host.N wrapper, else open a new one.
+            host="${name#@}"
+            _record_recent "$host"
+            target=$(_resume_candidate "@$host") \
+                && { attach_run "$target"; return; }
+            attach_run "$(zn -n "@$host")" ssh "$host"
+            ;;
+        *@*)  # user@host quick-connect: wrapper named after the host part
+            host="${name#*@}"; host="${host//[^A-Za-z0-9._-]/-}"
+            _record_recent "$host"
+            attach_run "$(zn -n "@$host")" ssh "$name"
+            ;;
+        *)
+            # <host>.<session> rides the ssh dispatcher aliases (myhost.dev
+            # attaches remote session dev): if the first segment is a known
+            # host, make a DETERMINISTIC wrapper @myhost.dev running ssh
+            # myhost.dev — re-picking it later reuses the same connection.
+            host="${name%%.*}"
+            if [ "$host" != "$name" ] && _hosts_dedup | grep -qx "$host"; then
+                _record_recent "$host"
+                attach_run "@$name" ssh "$name"
+            else
+                attach_run "$name"
+            fi
+            ;;
+        esac
+        ;;
+    esac
+}
+
+# ── modes ────────────────────────────────────────────────────────────────────
+case "$mode" in
+list)
+    command -v zmx >/dev/null 2>&1 || { _zs_err "zmx not installed — nothing to list"; exit 1; }
+    # --only=current: ctrl-x reload must keep the active alt-s/h/a view, but
+    # bind strings are static. fzf >=0.42 exports FZF_PROMPT to child
+    # processes — recover the view from it (older fzf: falls back to all,
+    # same as before this fix).
+    if [ "$only" = current ]; then
+        case "${FZF_PROMPT:-}" in
+            "⇲ "*)   # inside a drill view: reload THAT host's rows, don't
+                     # dump back to the full list (e.g. after a ctrl-x kill)
+                     host="${FZF_PROMPT#⇲ }"; host="${host%%>*}"; host="${host% }"
+                     _drill_rows "$host"; exit 0 ;;
+            "🏷 "*) # inside a label view: keep the scope on reload
+                     lv="${FZF_PROMPT#* }"; lv="${lv%%>*}"; lv="${lv% }"
+                     only="label:$lv" ;;
+            local*)  only=local ;;
+            remote*) only=remote ;;
+            *)       only=all ;;
+        esac
+    fi
+    list_rows
+    ;;
+classify)
+    # (tests) expose the classifier: zs --classify <rc> <stderr>
+    _classify_ssh_failure "${token:-0}" "${query:-}" ""
+    ;;
+labelbind)
+    # alt-y — scope the list to the HIGHLIGHTED row's role label in one action
+    # (FR-008 / US6-AC2). Generic rather than a hardcoded role: highlight any
+    # session and see everything sharing its role; alt-a returns to the full
+    # view. The `zmx get` here is one user-initiated call, never a render path.
+    case "${token:-}" in
+    s:*) name="${token#s:}"
+         lv=$(zmx get "$name" 2>/dev/null | tr "\n" " " | grep -oE "role=[^ ]+" | head -1)
+         if [ -n "$lv" ]; then
+             printf 'change-prompt(🏷 %s> )+clear-query+reload(zs --list --only=label:%s)' "$lv" "$lv"
+         else
+             printf 'change-header(no role label on %s — nothing to scope by; alt-a shows all)' "$name"
+         fi ;;
+    *)   printf 'change-header(alt-y scopes by a SESSION row label — this row has none)' ;;
+    esac
+    ;;
+stale)
+    # LOCAL sessions whose daemon can't do 0.7.0 labels ⇒ still on 0.6.0.
+    # Migration helper: `zs --stale` names the sessions to recreate after a
+    # zmx upgrade (a 0.7.0 client on a 0.6.0 server breaks multi-client render).
+    command -v zmx >/dev/null 2>&1 || { _zs_err "zmx not installed — nothing to list"; exit 1; }
+    zmx list --short 2>/dev/null | tr -d '\r' | while IFS= read -r n; do
+        case "$n" in @*|'') continue ;; esac
+        zmx get "$n" >/dev/null 2>&1 || printf '%s\n' "$n"
+    done
+    ;;
+label)
+    # get/set 0.7.0 session labels: `zs --label NAME` prints them,
+    # `zs --label NAME k=v ...` sets them (k= removes). Thin passthrough to zmx.
+    command -v zmx >/dev/null 2>&1 || { _zs_err "zmx not installed — nothing to list"; exit 1; }
+    [ -n "$token" ] || { echo "usage: zs --label <session> [k=v ...]" >&2; exit 2; }
+    if [ "$#" -eq 0 ]; then zmx get "$token"; else zmx set "$token" "$@"; fi
+    ;;
+preview)
+    case "${token:-}" in
+    s:*) name="${token#s:}"
+         # 0.7.0 label header above the scrollback (silent/absent on 0.6.0)
+         labels=$(zmx get "$name" 2>/dev/null | sed '/^$/d' | paste -sd' ' -)
+         [ -n "$labels" ] && printf '\033[2m🏷 %s\033[0m\n\n' "$labels"
+         out=$(zmx history "$name" --vt 2>/dev/null | _ansi_strip | tail -200)
+         # older zmx without --vt errors out -> fall back to raw history
+         [ -n "$out" ] || out=$(zmx history "$name" 2>/dev/null | _ansi_strip | tail -200)
+         printf '%s\n' "$out" ;;
+    r:*) host="${token#r:}"; host="${host%%.*}"; name="${token#r:*.}"
+         echo "── remote session $name on $host ──"
+         out=$(_remote_zmx "$host" "history $name --vt 2>/dev/null | tail -200" | _ansi_strip)
+         if [ -n "$out" ]; then printf '%s\n' "$out"
+         else echo "(no history / session gone / unreachable)"; fi ;;
+    h:*) host="${token#h:}"
+         echo "── ssh config: $host ──"
+         ssh -G "$host" 2>/dev/null | awk '/^(hostname|user|port|proxyjump|identityfile) /' | head -8
+         echo
+         echo "enter: ssh $host — its remote default session (one layer)"
+         echo "type @$host for a local @-tagged wrapper instead"
+         echo "ctrl-s: drill into this host's remote sessions (pick one to attach)" ;;
+    esac
+    ;;
+kill)
+    case "${token:-}" in
+    s:*) zmx kill "${token#s:}" >/dev/null 2>&1 ;;
+    esac
+    ;;
+killmulti)
+    # FR-005 — kill every marked session token (fzf {+1}); ignore host tokens.
+    # With nothing marked, fzf passes the highlighted row, so this stays a
+    # single-kill in that case. r: drill rows kill the REMOTE session (bounded
+    # ssh) and reap any matching local wrapper so no dead @name lingers.
+    for t in "$@"; do
+        case "$t" in
+        s:*) zmx kill "${t#s:}" >/dev/null 2>&1 ;;
+        r:*) host="${t#r:}"; host="${host%%.*}"; name="${t#r:*.}"
+             _remote_zmx "$host" "kill $name" >/dev/null 2>&1
+             zmx kill "@${t#r:}" >/dev/null 2>&1 ;;
+        esac
+    done
+    ;;
+actionhint)
+    # FR-002 — ONE dynamic header line that tells the TRUTH about enter.
+    # enter attaches the HIGHLIGHTED row whenever one matches (pick() prefers
+    # the selection); only a no-match enter acts on the typed query. So the
+    # enter half derives from the selection ($sel = {1}) when present, and a
+    # host-shaped typed query that DIVERGES from the highlighted row is called
+    # out and routed to tab/ctrl-n — never presented as what enter will do
+    # (US1-AC4: a wrong-host attach must not be silent). The static key legend
+    # lives in the footer, not here.
+    q="${token:-}"; qd="${q#\'}"
+    ex="$([ "$q" != "$qd" ] && printf ' [exact]')"
+    # marks note: {+1} args beyond (query, current). Marks affect ctrl-x ONLY —
+    # enter is bound clear-selection+accept, so attach is always the highlighted
+    # row; say so whenever real marks exist (>1, or a single mark ≠ current).
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "${1:-}" != "${sel:-}" ]; }; then
+        ex="$ex   [$# marked → ctrl-x kills; enter ignores marks]"
+    fi
+    qb="${qd#@}"; seg="${qb%%.*}"
+    ishost=""
+    [ -n "$qb" ] && _hosts_dedup | grep -qx -- "$seg" && ishost=1
+    # what enter REALLY does: the highlighted row, when there is one
+    enter=""; seltgt=""
+    case "${sel:-}" in
+    s:*) seltgt="${sel#s:}"; enter="enter: attach $seltgt" ;;
+    r:*) seltgt="@${sel#r:}"; enter="enter: attach $seltgt" ;;
+    h:*) seltgt="@${sel#h:}"; enter="enter: ssh ${sel#h:} (remote resume/create)" ;;
+    esac
+    if [ -n "$enter" ]; then
+        if [ -n "$ishost" ] && [ "$seltgt" != "@$qb" ] && [ "${seltgt#@"$qb".}" = "$seltgt" ]; then
+            # typed host-intent diverges from the highlighted row: say so
+            printf '%s   ·   typed @%s: tab completes it, ctrl-n creates LOCAL %s%s\n' \
+                "$enter" "$qb" "$qd" "$ex"
+        elif [ -n "$qd" ]; then
+            printf '%s   ·   ctrl-n: create LOCAL %s%s\n' "$enter" "$qd" "$ex"
+        else
+            printf '%s   ·   ctrl-n: new   ·   ctrl-s: drill a host%s\n' "$enter" "$ex"
+        fi
+    elif [ -n "$ishost" ]; then
+        # no matching row: enter acts on the query (classified)
+        if [ "$seg" = "$qb" ]; then
+            printf 'enter: ssh %s (remote resume/create; @%s = local wrapper)   ·   ctrl-n: create LOCAL %s   ·   ctrl-s: drill %s%s\n' \
+                "$seg" "$seg" "$qd" "$seg" "$ex"
+        else
+            printf 'enter: connect @%s   ·   ctrl-n: create LOCAL %s   ·   ctrl-s: drill %s%s\n' \
+                "$qb" "$qd" "$seg" "$ex"
+        fi
+    elif [ -n "$qd" ]; then
+        # ZERO MATCHES. fzf hands us an empty {1} when nothing matched, which is
+        # the only signal available (FZF_MATCH_COUNT is undocumented in the
+        # deployed fzf). An empty list is otherwise indistinguishable from a
+        # broken picker — and naming the likely cause covers the reported
+        # "searching mac14 shows nothing" case on a machine whose ssh config has
+        # no such host (FR-006).
+        printf 'no match for "%s" — no such session, and no ssh host by that name on this machine   ·   enter: attach/create %s   ·   ctrl-n: create LOCAL %s%s\n' \
+            "$qd" "$qd" "$qd" "$ex"
+    else
+        printf 'type a name, or pick a row — ctrl-s drills a host into its sessions%s\n' "$ex"
+    fi
+    ;;
+complete)
+    # FR-004 — tab completion. The TYPED host wins over the highlighted row:
+    # if the query's first segment names a known host (ws15.mes, @ws15.mes),
+    # complete the QUERY into its @ form — never the fuzzy-matched row's host
+    # (typing ws15.mes with @ws105.mesh.1 highlighted must not become ws105).
+    # This is exactly what the actionhint header promises (tab: @host.).
+    # Otherwise: complete the highlighted row — host -> @host. (cursor ready
+    # for a session), session -> its name verbatim, drill row -> its wrapper.
+    q="${query:-}"; qd="${q#\'}"; qd="${qd#@}"; seg="${qd%%.*}"
+    if [ -n "$qd" ] && _hosts_dedup | grep -qx -- "$seg"; then
+        printf 'change-query(@%s)' "$qd"
+        exit 0
+    fi
+    case "${token:-}" in
+    h:*) printf 'change-query(@%s)' "${token#h:}" ;;
+    s:*) printf 'change-query(%s)' "${token#s:}" ;;
+    r:*) printf 'change-query(@%s)' "${token#r:}" ;;
+    esac
+    ;;
+exacttoggle)
+    # FR-003 — toggle fzf's exact-search ' prefix; the header shows [exact].
+    q="${token:-}"
+    case "$q" in "'"*) printf '%s' "${q#\'}" ;; *) printf "'%s" "$q" ;; esac
+    ;;
+helpkeys)
+    # ? — full keymap in the preview pane (the footer shows only what fits).
+    cat <<'EOF'
+  zs picker — keys
+
+  enter        go: focus/attach a session; host row -> plain ssh (one
+               layer; type @host for a local @-tagged wrapper instead)
+  alt-enter    attach HERE (mirror a session open elsewhere)
+  ctrl-n       create a LOCAL session named exactly as typed
+  tab          complete: host -> @host.  ·  session -> its name
+  ctrl-s       drill a host: list its remote sessions (enter attaches
+               @host.sess); no zmx / unreachable -> plain connect
+  space        mark rows — marks feed ctrl-x (kill) ONLY; enter always
+               attaches the highlighted row, never the marked set
+  ctrl-x       kill the highlighted session, or all marked ones
+  alt-l/r/a    view: local / remote (wrappers+hosts) / all
+  alt-e        toggle exact matching (ws15 stops matching ws105)
+  ctrl-←/→     word-wise cursor movement
+  ctrl-/       toggle this preview pane
+  ?            this help
+  esc          back to the full list (inside a drill) · cancel (top level)
+
+  The top line updates as you type to show what enter / ctrl-n will do.
+  Move the cursor to dismiss this help.
+EOF
+    ;;
+drillbind)
+    # US4/FR-010 — ctrl-s on a HOST row: reload the SAME picker with that
+    # host's remote sessions (consistent interface — no separate fzf). Emits
+    # an fzf action string; non-host rows are a no-op (empty output). The
+    # header pins the drill-local keys (esc = back) while inside.
+    case "${token:-}" in
+    h:*) host="${token#h:}"
+         printf 'change-prompt(⇲ %s> )+change-header(sessions on %s — enter attach · ctrl-x kill remote · esc back)+clear-query+reload(zs --drill-rows h:%s)' \
+             "$host" "$host" "$host" ;;
+    esac
+    ;;
+escbind)
+    # esc — context-aware: inside a drill view (⇲ prompt) go BACK to the full
+    # list; at top level, cancel the picker as before.
+    case "${FZF_PROMPT:-}" in
+    "⇲ "*) printf 'change-prompt(zmx> )+clear-query+reload(zs --list --only=all)+transform-header(zs --actionhint {q})' ;;
+    *)     printf 'abort' ;;
+    esac
+    ;;
+drillrows)
+    _drill_rows "${token#h:}"
+    ;;
+picktest)
+    # (internal, tests only) drive run_choice on a token without fzf
+    run_choice go "${token:-}"
+    ;;
+hop)
+    # spec 003 US1: in-session switch hop — the ONE entry exempt from the
+    # $ZMX_SESSION guard. The shell inside a session is already on the
+    # session's host, so the picker lists THAT host's sessions (FR-002).
+    # On selection: write the token to the per-session handoff and detach;
+    # the enclosing attach loop (attach_run here, __zmx_attach_reap on the
+    # ssh path) consumes it and re-attaches the target — the client MOVES,
+    # depth stays 1 (FR-004). Outside a session: degrade to the normal picker.
+    command -v zmx >/dev/null 2>&1 || { echo "zs: zmx not installed" >&2; exit 1; }
+    if [ -z "${ZMX_SESSION:-}" ]; then
+        out=$(pick) || exit 130
+        run_choice "${out%%$'\t'*}" "${out#*$'\t'}"
+        exit
+    fi
+    out=$(pick) || exit 130
+    tok="${out#*$'\t'}"
+    # self-target: graceful no-op (never a broken self-nest)
+    [ "$tok" = "s:$ZMX_SESSION" ] && exit 0
+    printf '%s\n' "$tok" > "${XDG_RUNTIME_DIR:-/tmp}/zs-hop.$ZMX_SESSION"
+    exec zmx detach
+    ;;
+attach)
+    command -v zmx >/dev/null 2>&1 || { echo "zs: zmx not installed" >&2; exit 1; }
+    attach_run "$@"
+    ;;
+login)
+    # Shell replacement (kitty `shell` → zmx-login → here). Never error a
+    # brand-new tab into oblivion: missing zmx means plain login shell.
+    # (Missing/old fzf is fine — pick() serves the plain-menu fallback.)
+    if [ -n "${ZMX_SESSION:-}" ] || ! command -v zmx >/dev/null 2>&1; then
+        exec "${SHELL:-/bin/bash}" -l
+    fi
+    # Picker-created sessions always start in ~ (the tab may have inherited
+    # a project cwd via OSC 7; project-scoped creation is zp's job).
+    cd "$HOME" || true
+    while out=$(pick); do
+        run_choice "${out%%$'\t'*}" "${out#*$'\t'}" && exit 0
+        # detached (ctrl+\) → back to the picker
+    done
+    printf '\033]2;shell\007' > /dev/tty   # don't leave "zmx" on a plain tab
+    exec "${SHELL:-/bin/bash}" -l    # picker cancelled → plain shell
+    ;;
+pick)
+    # Reached in-session ONLY when there is no interactive terminal — with one,
+    # bare `zs` has already become a hop above (FR-004). Say WHY it did not, so
+    # a script author is not left guessing (FR-001).
+    if [ -n "${ZMX_SESSION:-}" ]; then
+        _zs_err "inside session \"$ZMX_SESSION\" with no interactive terminal — not hopping; run \`zs --hop\` explicitly, or detach first (ctrl+\\)"
+        exit 1
+    fi
+    command -v zmx >/dev/null 2>&1 || { echo "zs: zmx not installed" >&2; exit 1; }
+    cd "$HOME" || true   # picker-created sessions always start in ~
+    out=$(pick) || exit 130
+    run_choice "${out%%$'\t'*}" "${out#*$'\t'}"
+    ;;
+direct)
+    # zs NAME — skip the picker; needs no fzf at all. Resolution order
+    # mirrors a picker query: exact session > known host > free-form query
+    # (q: already handles user@host, host.sess, and plain new names).
+    if [ -n "${ZMX_SESSION:-}" ]; then
+        _zs_err "inside session \"$ZMX_SESSION\" — attaching from within a session would nest; run \`zs --hop\` to switch, or detach first (ctrl+\\)"
+        exit 1
+    fi
+    command -v zmx >/dev/null 2>&1 || { echo "zs: zmx not installed" >&2; exit 1; }
+    if zmx list --short 2>/dev/null | tr -d '\r' | grep -qx -- "$token"; then
+        run_choice go "s:$token"
+    elif _hosts_dedup | grep -qx -- "$token"; then
+        run_choice go "h:$token"
+    else
+        run_choice go "q:$token"
+    fi
+    ;;
+esac

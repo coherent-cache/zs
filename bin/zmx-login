@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Kitty shell entry (all machines): every new kitty tab/window/pane opens the
+# zs session picker (bower.sh model — sessions are named, purposeful things).
+# Enter resumes or creates; ctrl-n creates (typed or cwd-based name); ctrl-c
+# drops to a plain login shell. Detaching (ctrl+\) returns to the picker;
+# `exit` inside a session closes the tab. ZMX_NO_AUTO=1 skips straight to a
+# plain shell. Falls back to a plain login shell when zmx/fzf are missing.
+# /opt/homebrew/bin: fzf/tools on GUI-launched macOS kitty; harmless elsewhere.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+if [ -n "${ZMX_SESSION:-}" ] || [ -n "${ZMX_NO_AUTO:-}" ] \
+   || ! command -v zmx >/dev/null 2>&1 || ! command -v fzf >/dev/null 2>&1; then
+    exec "${SHELL:-/bin/bash}" -l
+fi
+exec zs --login

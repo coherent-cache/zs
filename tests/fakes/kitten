@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Fake kitten for the test suite: serves canned `@ ls` JSON from the file
+# named by $KITTEN_FAKE_LS; exits 1 when unset (kitty-absent simulation).
+printf '%s\n' "kitten $*" >> "${KITTEN_FAKE_LOG:-/dev/null}"
+
+for a in "$@"; do
+    if [ "$a" = "ls" ]; then
+        [ -n "${KITTEN_FAKE_LS:-}" ] && [ -r "$KITTEN_FAKE_LS" ] || exit 1
+        cat "$KITTEN_FAKE_LS"
+        exit 0
+    fi
+done
+exit 1

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Fake zmx for the test suite: serves canned `list` output from
+# $ZMX_FAKE_LIST, records every invocation to $ZMX_FAKE_LOG.
+printf '%s\n' "zmx $*" >> "${ZMX_FAKE_LOG:-/dev/null}"
+
+case "${1:-}" in
+list|ls)
+    [ -r "${ZMX_FAKE_LIST:-}" ] || exit 0
+    if [ "${2:-}" = "--short" ]; then
+        awk -F'\t' '{ n = $1; sub(/.*name=/, "", n); print n }' "$ZMX_FAKE_LIST"
+    else
+        cat "$ZMX_FAKE_LIST"
+    fi
+    ;;
+attach|a)  exit "${ZMX_FAKE_ATTACH_RC:-0}" ;;
+run|r)     exit 0 ;;
+kill|k)    exit "${ZMX_FAKE_KILL_RC:-0}" ;;   # rc injection: reap-failure tests
+history|hi)
+    # ZMX_FAKE_NO_VT=1 simulates an old zmx that rejects --vt
+    if [ -n "${ZMX_FAKE_NO_VT:-}" ] && [ "${3:-}" = "--vt" ]; then exit 1; fi
+    printf 'fake scrollback for %s\n' "${2:-}" ;;
+get)
+    # 0.7.0 labels: sessions named in $ZMX_FAKE_OLD run an old daemon (get fails,
+    # like real 0.6.0). Others succeed and emit canned labels from $ZMX_FAKE_LABELS.
+    for old in ${ZMX_FAKE_OLD:-}; do
+        [ "${2:-}" = "$old" ] && { printf 'error: session "%s" does not support labels (daemon too old?)\n' "$2" >&2; exit 1; }
+    done
+    [ -n "${ZMX_FAKE_LABELS:-}" ] && printf '%s\n' "$ZMX_FAKE_LABELS"
+    exit 0 ;;
+set|clear)  exit 0 ;;
+*)         exit 0 ;;
+esac

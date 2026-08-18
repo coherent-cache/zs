@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Fake ssh for the test suite: records argv to $SSH_FAKE_LOG. `-G` mode
+# emits a resolved-config stanza (hostname override via $SSH_FAKE_G_HOSTNAME
+# to simulate endpoint collisions); command mode prints $SSH_FAKE_STDOUT and
+# exits $SSH_FAKE_RC (next-name replies / failure simulation).
+#
+# $SSH_FAKE_STDERR writes to stderr so every FailureClass (spec 004 US1) is
+# reproducible offline: real OpenSSH reports the *cause* only on stderr and
+# returns 255 for every client-side failure, so a classifier that reads the
+# exit status alone cannot tell auth-denied from unreachable.
+printf '%s\n' "ssh $*" >> "${SSH_FAKE_LOG:-/dev/null}"
+
+if [ "${1:-}" = "-G" ]; then
+    host="${*: -1}"
+    printf 'hostname %s\n' "${SSH_FAKE_G_HOSTNAME:-$host.example}"
+    printf 'user test\nport 22\n'
+    exit 0
+fi
+
+[ -n "${SSH_FAKE_STDERR:-}" ] && printf '%s\n' "$SSH_FAKE_STDERR" >&2
+[ -n "${SSH_FAKE_STDOUT:-}" ] && printf '%s\n' "$SSH_FAKE_STDOUT"
+exit "${SSH_FAKE_RC:-0}"

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# zn — ad-hoc auto-numbered zmx sessions on THIS host, named <theme>.<N>.
+#
+#   zn                  create + attach the next session in the default theme (s.1, s.2, ...)
+#   zn THEME            create + attach the next in THEME          (e.g. zn dev -> dev.1, dev.2)
+#   zn THEME -r cmd     create the next in THEME, run cmd detached, print its name
+#   zn -l [THEME]       list the current sessions in THEME (default theme if omitted)
+#   zn -n [THEME]       print the next free name in THEME without creating it
+#
+# THEME may be given as a bare word (any position before -r) or via -p THEME.
+# N = 1 + the highest existing number for that theme, from this host's live `zmx list`.
+# Attach a specific one later with `ssh <tag>.<theme>.<N>` (e.g. ssh myhost.dev.1).
+set -u
+export PATH="$HOME/.local/bin:$PATH"
+
+theme=""
+mode=attach
+list_only=0
+next_only=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r|--run)            mode=run; shift; break ;;      # everything after -r is the command
+    -p|--prefix|--theme) theme="${2:?needs a theme}"; shift 2 ;;
+    -l|--list)           list_only=1; shift ;;
+    -n|--next)           next_only=1; shift ;;
+    -h|--help)           grep '^#' "$0" | cut -c3-; exit 0 ;;
+    --)                  shift; break ;;
+    -*)                  echo "zn: unknown option $1" >&2; exit 2 ;;
+    *)                   if [ -z "$theme" ]; then theme="$1"; shift; else break; fi ;;
+  esac
+done
+theme="${theme:-s}"
+
+# @ names are ssh wrapper sessions (zs territory): attaching one here would
+# spawn a LOCAL shell wearing a remote name. Name-only queries (-n/-l) are
+# fine — zs/zp use them for wrapper numbering.
+case "$theme" in
+@*) if [ "$list_only" -eq 0 ] && [ "$next_only" -eq 0 ]; then
+        echo "zn: @ names are ssh wrappers — create them via zs" >&2; exit 2
+    fi ;;
+esac
+
+next_name() {
+  local max=0 n num
+  while IFS= read -r n; do
+    n="${n%$'\r'}"                       # zmx output can carry a trailing CR
+    case "$n" in
+      "$theme".[0-9]*)
+        num="${n#"$theme".}"
+        case "$num" in
+          ''|*[!0-9]*) : ;;
+          *) [ "$num" -gt "$max" ] && max="$num" ;;
+        esac ;;
+    esac
+  done < <(zmx list --short 2>/dev/null)
+  printf '%s.%d\n' "$theme" "$((max + 1))"
+}
+
+if [ "$list_only" -eq 1 ]; then
+  zmx list --short 2>/dev/null | tr -d '\r' | grep -E "^${theme}\.[0-9]+$" || echo "(none)"
+  exit 0
+fi
+
+name="$(next_name)"
+
+if [ "$next_only" -eq 1 ]; then
+  printf '%s\n' "$name"
+  exit 0
+fi
+
+if [ "$mode" = run ]; then
+  [ $# -gt 0 ] || { echo "zn -r needs a command" >&2; exit 2; }
+  zmx set "$name" creator=zn role=job "cwd=${PWD##*/}" >/dev/null 2>&1 || true
+  zmx run "$name" -d "$@" >&2
+  printf '%s\n' "$name"          # stdout = just the name, so callers can capture it
+else
+  # Narrow the two-callers-at-once race: if the name got taken between
+  # next_name() and now, recompute once (zmx attach is create-or-attach).
+  if zmx list --short 2>/dev/null | tr -d '\r' | grep -qx "$name"; then
+    name="$(next_name)"
+  fi
+  exec zmx attach "$name"
+fi
